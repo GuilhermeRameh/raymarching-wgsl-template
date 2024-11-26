@@ -34,8 +34,16 @@ struct march_output {
 
 fn op_smooth_union(d1: f32, d2: f32, col1: vec3f, col2: vec3f, k: f32) -> vec4f
 {
-  var k_eps = max(k, 0.0001);
-  return vec4f(col1, d1);
+  // União suave usando um fator k
+  var h = clamp(0.5 + 0.5 * (d2 - d1) / max(k, 0.0001), 0.0, 1.0);
+
+  // Interpola cores suavemente
+  var color = mix(col2, col1, h);
+
+  // Calcula a distância final
+  var dist = mix(d2, d1, h);
+
+  return vec4f(color, dist);
 }
 
 fn op_smooth_subtraction(d1: f32, d2: f32, col1: vec3f, col2: vec3f, k: f32) -> vec4f
@@ -70,7 +78,7 @@ fn op(op: f32, d1: f32, d2: f32, col1: vec3f, col2: vec3f, k: f32) -> vec4f
 
 fn repeat(p: vec3f, offset: vec3f) -> vec3f
 {
-  return vec3f(0.0);
+  return modc(p + 0.5 * offset, offset) - 0.5 * offset;
 }
 
 fn transform_p(p: vec3f, option: vec2f) -> vec3f
@@ -112,6 +120,34 @@ fn scene(p: vec3f) -> vec4f // xyz = color, w = distance
       // y: k value
       // z: repeat mode (0: normal, 1: repeat)
       // w: repeat offset
+
+      // Get shape information
+      let shape_info = shapesinfob[i];
+      let shape_type = i32(shape_info.x);
+      let shape_index = i32(shape_info.y);
+      let shape = shapesb[shape_index];
+
+      // Apply transformations
+      var pos = p - shape.transform.xyz;
+      pos = transform_p(pos, shape.op.zw);
+
+      // Compute SDF based on shape type
+      var dist = 0.0;
+      var color = shape.color.xyz;
+
+      if (shape_type == 0) {
+        dist = sdf_sphere(pos, shape.radius, shape.quat);
+      } else if (shape_type == 1) {
+        dist = sdf_round_box(pos, shape.radius.xyz, shape.radius.w, shape.quat);
+      } else if (shape_type == 2) {
+        dist = sdf_torus(pos, shape.radius.xy, shape.quat);
+      }
+
+      if (i == 0) {
+        result = vec4f(color, dist);
+      } else {
+        result = op(shape.op.x, result.w, dist, result.xyz, color, shape.op.y);
+      }
     }
 
     return result;
@@ -131,6 +167,19 @@ fn march(ro: vec3f, rd: vec3f) -> march_output
       // raymarch algorithm
       // call scene function and march
       // if the depth is greater than the max distance or the distance is less than the epsilon, break
+      var p = ro + rd * depth;
+      var scene_result = scene(p);
+
+      if (scene_result.w < EPSILON) {
+          color = scene_result.xyz;
+          break;
+      }
+
+      depth += scene_result.w;
+
+      if (depth > MAX_DIST) {
+          break;
+      }
   }
 
   return march_output(color, depth, false);
@@ -138,13 +187,39 @@ fn march(ro: vec3f, rd: vec3f) -> march_output
 
 fn get_normal(p: vec3f) -> vec3f
 {
-  return vec3f(0.0);
+  let epsilon = 0.001;
+  return normalize(vec3f(
+      scene(p + vec3f(epsilon, 0.0, 0.0)).w - scene(p - vec3f(epsilon, 0.0, 0.0)).w,
+      scene(p + vec3f(0.0, epsilon, 0.0)).w - scene(p - vec3f(0.0, epsilon, 0.0)).w,
+      scene(p + vec3f(0.0, 0.0, epsilon)).w - scene(p - vec3f(0.0, 0.0, epsilon)).w
+  ));
 }
 
 // https://iquilezles.org/articles/rmshadows/
 fn get_soft_shadow(ro: vec3f, rd: vec3f, tmin: f32, tmax: f32, k: f32) -> f32
 {
-  return 0.0;
+  var res = 1.0; // Inicializa o resultado como "sem sombra"
+  var t = tmin; // Começa do valor mínimo de profundidade
+
+  // Percorre o raio para calcular a sombra suave
+  while (t < tmax) {
+      var p = ro + t * rd; // Ponto atual ao longo do raio
+      var d = scene(p).w; // Distância até o objeto mais próximo
+
+      if (d < 0.001) {
+          // Se a distância for menor que um epsilon, o ponto está dentro da sombra
+          return 0.0;
+      }
+
+      // Calcula a fração de sombra com base na distância
+      res = min(res, k * d / t);
+
+      // Avança ao longo do raio com um limite mínimo e máximo para estabilidade
+      t += clamp(d, 0.01, 0.1); // Avanço baseado na distância
+  }
+
+  // Garante que o valor esteja no intervalo [0, 1]
+  return clamp(res, 0.0, 1.0);
 }
 
 fn get_AO(current: vec3f, normal: vec3f) -> f32
@@ -199,7 +274,30 @@ fn get_light(current: vec3f, obj_color: vec3f, rd: vec3f) -> vec3f
   // - ambient occlusion (optional)
   // - ambient light
   // - object color
-  return ambient;
+
+  // Cálculo da direção da luz (do ponto atual para a luz)
+  var light_dir = normalize(light_position - current);
+
+  // Intensidade difusa (modelo Lambertian)
+  var diff_intensity = max(dot(normal, light_dir), 0.0);
+
+  // Cálculo de sombras suaves (projeção de sombras no plano)
+  var shadow = get_soft_shadow(current + normal * uniforms[23], light_dir, 0.001, MAX_DIST, 32.0);
+
+  // Ambient Occlusion (opcional)
+  var ao = get_AO(current, normal);
+
+  // Luz difusa final com sombras e AO
+  var diffuse = diff_intensity * obj_color * sun_color * shadow * ao;
+
+  // Modula a luz ambiente com o AO
+  ambient = ambient * ao * obj_color;
+
+  // Combina a luz ambiente e difusa
+  var color = mix(ambient, diffuse, diff_intensity);
+
+  // Garante que os valores de cor estejam no intervalo [0, 1]
+  return clamp(color, vec3f(0.0), vec3f(1.0));
 }
 
 fn set_camera(ro: vec3f, ta: vec3f, cr: f32) -> mat3x3<f32>
@@ -257,6 +355,9 @@ fn render(@builtin(global_invocation_id) id : vec3u)
   // move ray based on the depth
   // get light
   var color = vec3f(1.0);
+  var march_result = march(ro, rd);
+  var p = ro + march_result.depth * rd;
+  color = get_light(p, march_result.color, rd);
   
   // display the result
   color = linear_to_gamma(color);
